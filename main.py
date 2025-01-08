@@ -1,13 +1,24 @@
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException
+from bs4 import BeautifulSoup
+import requests
 from pydantic import BaseModel
-from typing import List, Optional
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 import firebase_admin
 from firebase_admin import credentials, firestore
+from fastapi.middleware.cors import CORSMiddleware
+from rapidfuzz import fuzz, process
+import re
+
+
+app = FastAPI()
+
+# Configuración de CORS para permitir solicitudes solo desde el frontend de React
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],  # Reemplaza con la URL de tu frontend de React
+    allow_credentials=True,
+    allow_methods=["*"],  # Permite cualquier método (GET, POST, etc.) 
+    allow_headers=["*"],  # Permite cualquier encabezado
+)
 
 # Inicialización de Firebase
 try:
@@ -18,243 +29,170 @@ except Exception as e:
     print(f"Error al inicializar Firebase: {e}")
     db = None  # Esto asegura que si falla, no haya un objeto db inválido
 
-# Crear instancia de la aplicación FastAPI
-app = FastAPI()
+# Modelo de datos para recibir el query
+class QueryRequest(BaseModel):
+    query: str
 
-# Configuración de CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Cambia este origen al del frontend si está en otro puerto
-    allow_credentials=True,
-    allow_methods=["*"],  # Permitir todos los métodos (GET, POST, etc.)
-    allow_headers=["*"],  # Permitir todos los encabezados
-)
+# Normalizar texto para comparación
+def normalize_text(text):
+    """Convierte texto a minúsculas, elimina puntuación y espacios extra."""
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", "", text)  # Eliminar signos de puntuación
+    text = re.sub(r"\s+", " ", text).strip()  # Espacios extra
+    return text
 
-# Definimos el modelo de datos para el Producto
-class Producto(BaseModel):
-    Referencia: str
-    Unidad: int
-    available: int
-    name: str
-    precio: int
+# Función para buscar la mejor coincidencia
+def find_best_match(user_question, faq_data):
+    """Encuentra la respuesta más relevante basada en similitud."""
+    user_question = normalize_text(user_question)
+    questions = [normalize_text(item["question"]) for item in faq_data]
     
+    # Buscar mejor coincidencia
+    match = process.extractOne(user_question, questions, scorer=fuzz.token_set_ratio)
+    if match and match[1] > 80:  # Similitud mayor al 80%
+        index = questions.index(match[0])
+        return faq_data[index]["answer"]
+    return "Lo siento, no encontré una respuesta a tu pregunta."
 
-# Endpoint para agregar un nuevo producto
-@app.post("/productos/", response_model=Producto)
-async def agregar_producto(producto: Producto):
+@app.get("/scrape")
+async def scrape_url(url: str):
     try:
-        # Verificar si ya existe un producto con la misma referencia
-        productos_ref = db.collection("productos")
-        query = productos_ref.where("Referencia", "==", producto.Referencia)
-        existing_product = query.stream()
+        response = requests.get(url)
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="URL no válida o inaccesible.")
+        
+        soup = BeautifulSoup(response.content, "html.parser")
+        title = soup.title.string if soup.title else "Sin título"
+        
+        # Ejemplo de extracción específica
+        headings = [h.get_text() for h in soup.find_all("h1")]
 
-        # Si el producto ya existe, lanzamos una excepción
-        if any(existing_product):
-            raise HTTPException(status_code=400, detail="Producto con esa referencia ya existe.")
+        # Guardar en Firestore
+        doc_ref = db.collection("scraped_data").add({
+            "url": url,
+            "title": title,
+            "headings": headings,
+            "timestamp": firestore.SERVER_TIMESTAMP,
+        })
         
-        # Agregar el nuevo producto a la base de datos
-        producto_dict = producto.dict()  # Convertir el modelo a un diccionario
-        db.collection("productos").add(producto_dict)
-        
-        return producto  # Retornar el producto agregado
+        return {"url": url, "title": title, "headings": headings}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al agregar el producto: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error en scraping: {str(e)}")
 
-
-# Endpoint para buscar productos por referencia
-@app.get("/productos/", response_model=List[Producto])
-async def get_productos(referencia: Optional[str] = Query(None, alias="referencia")):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Firebase no está inicializado")
-
-    if referencia:  # Si se pasa una referencia
-        productos_ref = db.collection("productos")
-        query = productos_ref.where("Referencia", "==", referencia)
-        productos = query.stream()
-
-        productos_lista = []
-        for doc in productos:
-            producto = doc.to_dict()
-            producto["Referencia"] = producto.get("Referencia", doc.id)  # Agregar la referencia si no está
-            productos_lista.append(producto)
-
-        return productos_lista if productos_lista else []
-    else:
-        return []
+# Endpoint para agregar preguntas y respuestas (sin cambios)
+@app.get("/add_faq_data")
+async def add_faq_data():
     
-    
-    # Endpoint para editar un producto por referencia
-@app.put("/productos/", response_model=Producto)
-async def editar_producto(referencia: str, producto: Producto):
     if db is None:
-        raise HTTPException(status_code=500, detail="Firebase no está inicializado")
+        return {"error": "Firebase no está inicializado correctamente."}
     
     try:
-        # Buscar el producto en la base de datos usando la referencia
-        productos_ref = db.collection("productos")
-        query = productos_ref.where("Referencia", "==", referencia)
-        productos = query.stream()
-
-        productos_lista = [doc for doc in productos]
+        # Crear un conjunto de preguntas y respuestas de ejemplo
+        faq_data = [
+            {"question":"Cuando comienza el semestre", "answer":{"22 de Octubre 2024 : (Estudiantes nuevos)","10 de Febrero 2025: (Induccion Estudiantes nuevos)","21 de Diciembre 2024: (Limite de pago sin recargo estudiantes antiguos. Todas las escuelas)","10 de Diciembre 2024:(Limite de matricula estudiantes antiguos. Todas las escuelas)"}},
+            {"question":"Que servicios manejan", "answer":["Aliados","Bienestar Estudiantil","Centro Cultural","Colegios","Educacion Digital","Emprendimientos","Proyectos"]},
+           {"question": "Como inicio sesion", "answer":"Para iniciar sesion ingresas a este link www.cesde.com "},
+           {"question": "Que descuentos manejan", "answer":["Si eres afiliado a comfama Aplicas a lo siguiente:","Tarifa A: 35%","Tarifa B: 30%"]},
+            {"question": "¿Cuales son los medios de pago?", "answer":["Presencial", "pago en linea (todas las tarjetas de crédito o debito)", "pago con casantías", "banco davivienda (liquidación impresa)", "banco caja social (liquidación impresa)", "financiación",  ]},
+              {"question": "Cuantas sedes tiene el cesde", "answer": "contamos con 6 sedes a nivel de Antioquia"},
+              {
+    "question": "¿Dónde están ubicados?",
+    "answer": [
+        "Medellín",
+        "Bello",
+        "Rionegro",
+        "La Pintada",
+        "Apartadó",
+        "Bogotá",
+       
+    ]
+}
         
-        if not productos_lista:
-            raise HTTPException(status_code=404, detail="Producto no encontrado.")  # Si no hay productos, lanzar error
-
-        # Asumiendo que solo hay un producto con la referencia (ya que la referencia debería ser única)
-        producto_doc = productos_lista[0]  # Tomar el primer producto que coincida con la referencia
-        producto_ref = productos_ref.document(producto_doc.id)
+        ]
         
-        # Actualizar el producto en la base de datos
-        producto_dict = producto.dict(exclude_unset=True)  # Excluir los campos no establecidos
-        producto_ref.update(producto_dict)
+        # Añadir cada pregunta y respuesta a la colección 'faq'
+        for item in faq_data:
+            db.collection("faq").add({
+                "question": item["question"],
+                "answer": item["answer"],
+                "timestamp": firestore.SERVER_TIMESTAMP
+            })
         
-        # Retornar el producto actualizado
-        return producto
-
+        return {"message": "Datos de preguntas y respuestas añadidos correctamente."}
+    
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al editar el producto: {str(e)}")
+        return {"error": f"Error al agregar los datos de preguntas y respuestas: {str(e)}"}
 
-# Endpoint para eliminar un producto por referencia
-@app.delete("/productos/", response_model=Producto)
-async def eliminar_producto(referencia: str = Query(..., alias="referencia")):
+# Nuevo endpoint para realizar consultas basadas en similitud
+@app.post("/ask_faq")
+async def ask_faq(query: QueryRequest):
     if db is None:
-        raise HTTPException(status_code=500, detail="Firebase no está inicializado")
+        return {"error": "Firebase no está inicializado correctamente."}
     
     try:
-        # Buscar el producto en la base de datos usando la referencia
-        productos_ref = db.collection("productos")
-        query = productos_ref.where("Referencia", "==", referencia)
-        productos = query.stream()
-
-        # Verificar si se encontró el producto
-        producto_doc = None
-        for doc in productos:
-            producto_doc = doc
-            break  # Solo necesitamos el primer documento que coincida
-
-        if not producto_doc:
-            raise HTTPException(status_code=404, detail="Producto no encontrado.")
-
-        # Eliminar el producto de la base de datos
-        producto_ref = db.collection("productos").document(producto_doc.id)
-        producto_ref.delete()
-
-        # Retornar el producto eliminado
-        return producto_doc.to_dict()
-
+        user_question = query.query
+        user_question_normalized = normalize_text(user_question)
+        
+        # Recuperar todas las preguntas y respuestas de Firestore
+        docs = db.collection("faq").stream()
+        faq_data = [{"question": doc.to_dict()["question"], 
+                     "answer": doc.to_dict()["answer"]} for doc in docs]
+        
+        # Buscar la mejor coincidencia
+        response = find_best_match(user_question_normalized, faq_data)
+        return {"answer": response}
+    
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al eliminar el producto: {str(e)}")
+        return {"error": f"Error al procesar la pregunta: {str(e)}"}
 
-
-# Función para generar estadísticas
-def generar_estadisticas(productos_lista):
-    # Crear un DataFrame a partir de la lista de productos
-    df = pd.DataFrame(productos_lista)
+@app.get("/get_faq_data")
+async def get_faq_data():
+    if db is None:
+        return {"error": "Firebase no está inicializado correctamente."}
     
-    if df.empty:
-        raise HTTPException(status_code=404, detail="No se encontraron productos en la base de datos")
+    try:
+        # Obtener todos los documentos de la colección 'faq'
+        docs = db.collection("faq").stream()
+        
+        faq_list = []
+        for doc in docs:
+            faq_list.append(doc.to_dict())
+        
+        return {"faq": faq_list}
     
-    # Verificar que las columnas necesarias existan
-    columnas_requeridas = {"name", "precio", "Unidad", "available"}
-    if not columnas_requeridas.issubset(df.columns):
-        raise HTTPException(status_code=500, detail="Faltan columnas necesarias en los datos (name, precio, Unidad, available)")
+    except Exception as e:
+        return {"error": f"Error al obtener los datos de preguntas y respuestas: {str(e)}"}
     
-    # Estadísticas básicas
-    venta_max = df["precio"].max()
-    venta_min = df["precio"].min()
-    venta_max_datos = df[df["precio"] == venta_max].to_dict(orient="records")
-    venta_min_datos = df[df["precio"] == venta_min].to_dict(orient="records")
+    # Endpoint para consultar las preguntas y respuestas en Firestore
+@app.post("/chatbot/")
+async def chatbot(query_request: QueryRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Firebase no está inicializado correctamente.")
     
- # Filtrar los productos más caros (por ejemplo, los 5 más caros)
-    df_top = df.nlargest(5, "precio")  # Selecciona los 5 productos más caros
+    try:
+        query = query_request.query  # Obtener el 'query' del modelo recibido
+        normalized_query = normalize_text(query)
+
+        # Obtener todas las preguntas y respuestas de la colección 'faq'
+        docs = db.collection("faq").stream()
+        faq_data = [{"question": doc.to_dict().get("question"), "answer": doc.to_dict().get("answer")} for doc in docs]
+
+        # Normalizar preguntas de la base de datos
+        questions_normalized = [normalize_text(item["question"]) for item in faq_data]
+
+        # Usar Rapidfuzz para encontrar la mejor coincidencia
+        best_match = process.extractOne(normalized_query, questions_normalized)
+
+        # Configura un umbral de similitud
+        threshold = 70  # Ajusta este valor según la precisión deseada
+        if best_match and best_match[1] > threshold:
+            # Obtener la respuesta correspondiente a la mejor coincidencia
+            index = questions_normalized.index(best_match[0])
+            return {"query": query, "answer": faq_data[index]["answer"]}
+
+        # Si no hay coincidencias suficientemente cercanas
+        return {"query": query, "answer": "Lo siento, no tengo información sobre eso."}
     
-    # Graficar precios de los productos más caros
-    plt.figure(figsize=(10, 6))
-    sns.barplot(data=df_top, x="name", y="precio", palette="coolwarm")
-    plt.title("productos más caros", fontsize=16)
-    plt.xlabel("Producto", fontsize=12)
-    plt.ylabel("Precio", fontsize=12)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    grafico_precio_path = "productos_precio.png"
-    plt.savefig(grafico_precio_path)
-    plt.close()
-
-    # Graficar productos con más unidades disponibles (gráfico de dona)
-    productos_mas_unidades = df[df["Unidad"] > 0].sort_values(by="Unidad", ascending=False).head(4)
-    unidades = productos_mas_unidades["Unidad"]
-    nombres = productos_mas_unidades["name"]
-
-    # Gráfico de dona
-    plt.figure(figsize=(10, 6))
-    plt.pie(unidades, labels=nombres, autopct='%1.1f%%', startangle=90, colors=sns.color_palette("Blues_d", len(unidades)))
-    plt.title("Productos con más unidades disponibles", fontsize=16)
-    plt.gca().set_aspect('equal')  # Asegura que el gráfico sea circular
-    plt.tight_layout()
-    grafico_unidades_path = "productos_mas_unidades_dona.png"
-    plt.savefig(grafico_unidades_path)
-    plt.close()
-
-    # Graficar productos no disponibles (scatter plot)
-    productos_no_disponibles = df[df["available"] == 0]
-    plt.figure(figsize=(10, 6))
-    sns.barplot(data=productos_no_disponibles, x="name", y="precio", palette="coolwarm")
-    plt.title("Productos no disponibles", fontsize=14)
-    plt.xlabel("Producto", fontsize=10)
-    plt.ylabel("Precio", fontsize=10)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    grafico_no_disponibles_path = "productos_no_disponibles.png"
-    plt.savefig(grafico_no_disponibles_path)
-    plt.close()
-
-    # Retornar estadísticas y gráficos generados
-    return {
-        "venta_max": venta_max,
-        "venta_min": venta_min,
-        "venta_max_datos": venta_max_datos,
-        "venta_min_datos": venta_min_datos,
-        "grafico_precio_url": "/productos/estadisticas/grafico_precio",
-        "grafico_unidades_url": "/productos/estadisticas/grafico_unidades",
-        "grafico_no_disponibles_url": "/productos/estadisticas/grafico_no_disponibles"
-    }
-
-# Endpoint para generar estadísticas
-@app.get("/productos/estadisticas")
-async def estadisticas_productos():
-    # Recuperar datos de Firestore
-    productos_ref = db.collection("productos")
-    productos = productos_ref.stream()
-    
-    productos_lista = [doc.to_dict() for doc in productos]
-    
-    # Generar estadísticas
-    resultado = generar_estadisticas(productos_lista)
-
-    # Devolver estadísticas y los gráficos como URLs
-    return {
-        "venta_max": resultado["venta_max"],
-        "venta_min": resultado["venta_min"],
-        "venta_max_datos": resultado["venta_max_datos"],
-        "venta_min_datos": resultado["venta_min_datos"],
-        "grafico_precio_url": resultado["grafico_precio_url"],
-        "grafico_unidades_url": resultado["grafico_unidades_url"],
-        "grafico_no_disponibles_url": resultado["grafico_no_disponibles_url"]
-    }
-
-# Endpoint para servir los gráficos generados
-@app.get("/productos/estadisticas/grafico_precio")
-async def obtener_grafico_precio():
-    grafico_precio_path = "productos_precio.png"
-    return FileResponse(grafico_precio_path, media_type="image/png", filename="productos_precio.png")
-
-@app.get("/productos/estadisticas/grafico_unidades")
-async def obtener_grafico_unidades():
-    grafico_unidades_path = "productos_mas_unidades_dona.png"
-    return FileResponse(grafico_unidades_path, media_type="image/png", filename="productos_mas_unidades_dona.png")
-
-@app.get("/productos/estadisticas/grafico_no_disponibles")
-async def obtener_grafico_no_disponibles():
-    grafico_no_disponibles_path = "productos_no_disponibles.png"
-    return FileResponse(grafico_no_disponibles_path, media_type="image/png", filename="productos_no_disponibles.png")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al procesar la consulta: {str(e)}")
